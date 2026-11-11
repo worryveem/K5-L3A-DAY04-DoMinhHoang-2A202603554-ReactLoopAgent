@@ -1,6 +1,12 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import math
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import urllib.error
 import urllib.request
 
@@ -11,17 +17,67 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
+_request_lock = threading.Lock()
+_next_request_at = {}
+
+
+def _wait_request_slot(url, interval):
+    # Chung cho agent và judge, kể cả khi eval dùng nhiều workers.
+    with _request_lock:
+        remaining = _next_request_at.get(url, 0) - time.monotonic()
+        while remaining > 0:
+            time.sleep(min(remaining, 60))
+            remaining = _next_request_at.get(url, 0) - time.monotonic()
+        _next_request_at[url] = time.monotonic() + interval
+
+
+def _defer_requests(url, delay):
+    with _request_lock:
+        _next_request_at[url] = max(_next_request_at.get(url, 0),
+                                    time.monotonic() + delay)
+
+
+def _retry_delay(headers, fallback):
+    value = headers.get('Retry-After') if headers else None
+    try:
+        seconds = float(value)
+    except (ValueError, TypeError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return fallback
+    return max(fallback, seconds) if math.isfinite(seconds) else fallback
+
 
 def post_json(url, headers, payload):
+    interval = float(os.getenv('LAB_API_MIN_INTERVAL', '5'))
+    retries = int(os.getenv('LAB_API_MAX_RETRIES', '3'))
+    if not math.isfinite(interval) or not 0 <= interval <= 60 or not 0 <= retries <= 5:
+        raise ValueError('LAB_API_MIN_INTERVAL phải từ 0–60; LAB_API_MAX_RETRIES từ 0–5.')
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    for attempt in range(retries + 1):
+        _wait_request_slot(url, interval)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Không in response body, headers, request hoặc API key.
+            delay = _retry_delay(exc.headers, min(15 * 2 ** attempt, 60))
+            can_retry = exc.code in (429, 500, 502, 503, 504) and attempt < retries
+            if can_retry and delay <= 60:
+                _defer_requests(url, delay)
+                print(f'HTTP {exc.code}: chờ {delay:.0f}s, thử lại '
+                      f'{attempt + 1}/{retries}.', file=sys.stderr, flush=True)
+                exc.close()
+                continue
+            exc.close()
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; đã dừng sau '
+                               f'{attempt + 1} lần gọi. Kiểm tra quota/credit hoặc thử sau.') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
